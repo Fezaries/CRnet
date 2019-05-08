@@ -6,7 +6,9 @@ Version 1.0
 python3.6, pytorch0.4 required
 
 # Dataset
-The code uses the ResNet101 features provided by the paper: Zero-Shot Learning - A Comprehensive Evaluation of the Good, the Bad and the Ugly, and follows its GZSL settings. The features can be download here: http://datasets.d2.mpi-inf.mpg.de/xian/xlsa17.zip
+The code uses the ResNet101 features provided by the paper: Zero-Shot Learning - A Comprehensive Evaluation of the Good, the Bad and the Ugly, and follows its GZSL settings. 
+
+The features can be download here: http://datasets.d2.mpi-inf.mpg.de/xian/xlsa17.zip
 
 # Training
 
