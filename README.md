@@ -10,7 +10,8 @@ The code uses the ResNet101 features provided by the paper: Zero-Shot Learning -
 
 # Training
 
-"python CUB_train.py" to train the model;
+"python CUB_train.py" to train the model.
+
 "python CUB_evaluate.py" to test.
 
 * Loss starts to decrease at approximately episode 30000.
