@@ -22,6 +22,8 @@ Trained models can be downloaded from https://drive.google.com/open?id=1a1cAG1iO
 
 ## Ciation
 
+If you find this work useful for your project, cite:
+
 ```
 @inproceedings{zhang2019co,
   title={Co-Representation Network for Generalized Zero-Shot Learning},
