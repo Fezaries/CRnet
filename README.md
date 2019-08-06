@@ -1,7 +1,7 @@
 # CRnet
 An implementation for the paper: Co-Representation Network for Generalized Zero-Shot Learning
 
-Version 1.0
+Version 1.01
 
 python3.6, pytorch0.4 required
 
