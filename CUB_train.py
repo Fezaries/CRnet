@@ -100,7 +100,7 @@ train_data = TensorDataset(train_features,train_label)
 # initial algorithm
 print("init networks")
 att = np.unique(att,axis=0)
-kmeans = KMeans(n_clusters=K, random_state=9).fit(att) ### field number : K=4
+kmeans = KMeans(n_clusters=K, random_state=1337).fit(att) ### field number : K=4
 att = kmeans.cluster_centers_
 att = torch.tensor(att).float().cuda()
 
