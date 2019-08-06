@@ -23,7 +23,7 @@ f.close()
 
 
 ###############################################################################
-
+K = 4
 BATCH_SIZE = 32
 EPISODE = 130000
 TEST_EPISODE = 1000
@@ -99,8 +99,8 @@ train_data = TensorDataset(train_features,train_label)
 
 # initial algorithm
 print("init networks")
-
-kmeans = KMeans(n_clusters=4, random_state=9).fit(att) ### field number : K=4
+att = np.unique(att,axis=0)
+kmeans = KMeans(n_clusters=K, random_state=9).fit(att) ### field number : K=4
 att = kmeans.cluster_centers_
 att = torch.tensor(att).float().cuda()
 
