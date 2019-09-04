@@ -48,7 +48,7 @@ trainval_loc = matcontent['trainval_loc'].squeeze() - 1
 test_seen_loc = matcontent['test_seen_loc'].squeeze() - 1
 test_unseen_loc = matcontent['test_unseen_loc'].squeeze() - 1
 
-attribute = matcontent['original_att'].T * 100
+attribute = matcontent['original_att'].T * 100 # Scaled to [0,100] to keep consistent with AWA so that similar learning strategies can be adopted.
 
 x = feature[trainval_loc] # train_features
 train_label_ori = label[trainval_loc].astype(int)  # train_label
