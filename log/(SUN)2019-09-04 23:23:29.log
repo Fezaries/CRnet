@@ -1,0 +1,1787 @@
+import torch
+import torch.nn as nn
+import torch.tensor as tensor
+from torch.utils.data import DataLoader,TensorDataset
+import numpy as np
+import scipy.io as sio
+from sklearn.cluster import KMeans
+from net import CooperationModule, RelationModule
+from utils import Logger, evaluate
+import sys
+import time
+
+
+
+
+sys.stdout = Logger('log/'+time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())+'.log')
+
+
+with open('SUN_train.py') as f:
+    contents = f.read()
+    print(contents)
+f.close()
+
+
+###############################################################################
+K=12
+BATCH_SIZE = 32  # Not recommended to change this
+EPISODE = 130000
+TEST_EPISODE = 1000
+LEARNING_RATE = 1e-5
+GPU = 0
+
+###############################################################################
+# step 1: init dataset
+print("init dataset")
+
+dataroot = './data'
+dataset = 'SUN'
+image_embedding = 'res101'
+class_embedding = 'att_splits'
+
+matcontent = sio.loadmat(dataroot + "/" + dataset + "/" + image_embedding + ".mat")
+feature = matcontent['features'].T
+label = matcontent['labels'].astype(int).squeeze() - 1
+matcontent = sio.loadmat(dataroot + "/" + dataset + "/" + class_embedding + ".mat")
+# numpy array index starts from 0, matlab starts from 1
+trainval_loc = matcontent['trainval_loc'].squeeze() - 1
+test_seen_loc = matcontent['test_seen_loc'].squeeze() - 1
+test_unseen_loc = matcontent['test_unseen_loc'].squeeze() - 1
+
+attribute = matcontent['original_att'].T * 100
+
+x = feature[trainval_loc] # train_features
+train_label_ori = label[trainval_loc].astype(int)  # train_label
+att = attribute[train_label_ori] # train attributes
+
+att = torch.tensor(att).float().cuda()
+
+x_test = feature[test_unseen_loc]  # test_feature
+test_label = label[test_unseen_loc].astype(int) # test_label
+x_test_seen = feature[test_seen_loc]  #test_seen_feature
+test_label_seen = label[test_seen_loc].astype(int) # test_seen_label
+test_id = np.unique(test_label)   # test_id
+att_pro = attribute[test_id]      # test_attribute
+
+# train set
+train_features=torch.from_numpy(x)
+print(train_features.shape)
+
+train_label=torch.from_numpy(train_label_ori).unsqueeze(1)
+print(train_label.shape)
+
+# attributes
+all_attributes=np.array(attribute)
+print(all_attributes.shape)
+
+attributes = torch.from_numpy(attribute)
+# test set
+
+test_features=torch.from_numpy(x_test)
+print(test_features.shape)
+
+test_label=torch.from_numpy(test_label).unsqueeze(1)
+print(test_label.shape)
+
+testclasses_id = np.array(test_id)
+print(testclasses_id.shape)
+
+test_attributes = torch.from_numpy(att_pro).float()
+print(test_attributes.shape)
+
+test_seen_features = torch.from_numpy(x_test_seen)
+print(test_seen_features.shape)
+
+test_seen_label = torch.from_numpy(test_label_seen)
+
+train_data = TensorDataset(train_features,train_label)
+###########################################################################
+
+# initial algorithm
+print("init networks")
+att = np.unique(att,axis=0)
+kmeans = KMeans(n_clusters=K, random_state=1337).fit(att)
+att = kmeans.cluster_centers_
+att = torch.tensor(att).float().cuda()
+
+
+CM = CooperationModule(att)
+RM = RelationModule()
+
+CM.cuda(GPU)
+RM.cuda(GPU)
+
+CM_optim = torch.optim.Adam(CM.parameters(),lr=LEARNING_RATE*5, weight_decay=1e-6)
+RM_optim = torch.optim.Adam(RM.parameters(),lr=LEARNING_RATE)
+
+print("training...")
+last_H = 0.0
+
+for episode in range(EPISODE):
+
+    train_loader = DataLoader(train_data,batch_size=BATCH_SIZE,shuffle=True)
+
+    batch_features,batch_labels = train_loader.__iter__().next()
+
+    sample_labels = []
+    for label in batch_labels.numpy():
+        if label not in sample_labels:
+            sample_labels.append(label)
+
+    sample_attributes = torch.Tensor([all_attributes[i] for i in sample_labels]).squeeze(1)
+    class_num = sample_attributes.shape[0]
+
+    batch_features = tensor(batch_features).cuda(GPU).float()  # 32*2048
+    sample_features = CM(tensor(sample_attributes).cuda(GPU))  # x*312
+
+
+    sample_features_ext = sample_features.unsqueeze(0).repeat(BATCH_SIZE,1,1)
+    batch_features_ext = batch_features.unsqueeze(0).repeat(class_num,1,1)
+    batch_features_ext = torch.transpose(batch_features_ext,0,1)
+
+    relation_pairs = torch.cat((sample_features_ext,batch_features_ext),2).view(-1,4096)
+    relations = RM(relation_pairs).view(-1,class_num)
+
+    # re-build batch_labels according to sample_labels
+    sample_labels = np.array(sample_labels)
+    re_batch_labels = []
+    for label in batch_labels.numpy():
+        index = np.argwhere(sample_labels==label)
+        re_batch_labels.append(index[0][0])
+    re_batch_labels = torch.LongTensor(re_batch_labels)
+
+    # loss
+    mse = nn.MSELoss().cuda(GPU)
+    one_hot_labels = tensor(torch.zeros(BATCH_SIZE, class_num).scatter_(1, re_batch_labels.view(-1,1), 1)).cuda(GPU)
+    loss = mse(relations,one_hot_labels)
+
+    # update
+    CM.zero_grad()
+    RM.zero_grad()
+
+    loss.backward()
+
+    CM_optim.step()
+    RM_optim.step()
+
+    if (episode+1)%100 == 0:
+            print("episode:",episode+1,"loss %.4f" % loss.item())
+
+    if (episode+1)%2000 == 0:
+        # test
+        print("Testing...")
+
+
+        gzsl_unseen_accuracy = evaluate(test_features,test_label,np.arange(717),attributes, CM, RM, GPU)
+        gzsl_seen_accuracy = evaluate(test_seen_features,test_seen_label,np.arange(717),attributes, CM, RM, GPU)
+
+        H = 2 * gzsl_seen_accuracy * gzsl_unseen_accuracy / (gzsl_unseen_accuracy + gzsl_seen_accuracy)
+
+        print('seen=%.4f, unseen=%.4f, h=%.4f' % (gzsl_seen_accuracy, gzsl_unseen_accuracy, H))
+
+        if H > last_H:
+
+
+            # save networks
+            torch.save(CM,"./models/SUN_CM.pkl")
+            torch.save(RM,"./models/SUN_RM.pkl")
+
+            print("save networks for episode:",episode)
+
+            last_H = H
+
+
+
+
+init dataset
+torch.Size([10320, 2048])
+torch.Size([10320, 1])
+(717, 102)
+torch.Size([1440, 2048])
+torch.Size([1440, 1])
+(72,)
+torch.Size([72, 102])
+torch.Size([2580, 2048])
+init networks
+training...
+episode: 100 loss 0.0323
+episode: 200 loss 0.0323
+episode: 300 loss 0.0333
+episode: 400 loss 0.0312
+episode: 500 loss 0.0312
+episode: 600 loss 0.0345
+episode: 700 loss 0.0323
+episode: 800 loss 0.0333
+episode: 900 loss 0.0323
+episode: 1000 loss 0.0312
+episode: 1100 loss 0.0312
+episode: 1200 loss 0.0312
+episode: 1300 loss 0.0323
+episode: 1400 loss 0.0323
+episode: 1500 loss 0.0312
+episode: 1600 loss 0.0333
+episode: 1700 loss 0.0323
+episode: 1800 loss 0.0323
+episode: 1900 loss 0.0312
+episode: 2000 loss 0.0323
+Testing...
+class num: 717
+class num: 717
+seen=0.0016, unseen=0.0000, h=0.0000
+episode: 2100 loss 0.0333
+episode: 2200 loss 0.0333
+episode: 2300 loss 0.0333
+episode: 2400 loss 0.0312
+episode: 2500 loss 0.0333
+episode: 2600 loss 0.0333
+episode: 2700 loss 0.0312
+episode: 2800 loss 0.0312
+episode: 2900 loss 0.0333
+episode: 3000 loss 0.0312
+episode: 3100 loss 0.0323
+episode: 3200 loss 0.0312
+episode: 3300 loss 0.0323
+episode: 3400 loss 0.0333
+episode: 3500 loss 0.0323
+episode: 3600 loss 0.0312
+episode: 3700 loss 0.0323
+episode: 3800 loss 0.0333
+episode: 3900 loss 0.0312
+episode: 4000 loss 0.0323
+Testing...
+class num: 717
+class num: 717
+seen=0.0016, unseen=0.0000, h=0.0000
+episode: 4100 loss 0.0312
+episode: 4200 loss 0.0323
+episode: 4300 loss 0.0323
+episode: 4400 loss 0.0333
+episode: 4500 loss 0.0312
+episode: 4600 loss 0.0323
+episode: 4700 loss 0.0333
+episode: 4800 loss 0.0333
+episode: 4900 loss 0.0333
+episode: 5000 loss 0.0312
+episode: 5100 loss 0.0333
+episode: 5200 loss 0.0312
+episode: 5300 loss 0.0312
+episode: 5400 loss 0.0323
+episode: 5500 loss 0.0312
+episode: 5600 loss 0.0323
+episode: 5700 loss 0.0312
+episode: 5800 loss 0.0323
+episode: 5900 loss 0.0357
+episode: 6000 loss 0.0312
+Testing...
+class num: 717
+class num: 717
+seen=0.0016, unseen=0.0000, h=0.0000
+episode: 6100 loss 0.0312
+episode: 6200 loss 0.0323
+episode: 6300 loss 0.0312
+episode: 6400 loss 0.0323
+episode: 6500 loss 0.0323
+episode: 6600 loss 0.0323
+episode: 6700 loss 0.0323
+episode: 6800 loss 0.0312
+episode: 6900 loss 0.0312
+episode: 7000 loss 0.0323
+episode: 7100 loss 0.0312
+episode: 7200 loss 0.0323
+episode: 7300 loss 0.0312
+episode: 7400 loss 0.0312
+episode: 7500 loss 0.0323
+episode: 7600 loss 0.0312
+episode: 7700 loss 0.0323
+episode: 7800 loss 0.0323
+episode: 7900 loss 0.0323
+episode: 8000 loss 0.0312
+Testing...
+class num: 717
+class num: 717
+seen=0.0016, unseen=0.0000, h=0.0000
+episode: 8100 loss 0.0312
+episode: 8200 loss 0.0312
+episode: 8300 loss 0.0323
+episode: 8400 loss 0.0333
+episode: 8500 loss 0.0312
+episode: 8600 loss 0.0323
+episode: 8700 loss 0.0312
+episode: 8800 loss 0.0323
+episode: 8900 loss 0.0312
+episode: 9000 loss 0.0312
+episode: 9100 loss 0.0323
+episode: 9200 loss 0.0333
+episode: 9300 loss 0.0323
+episode: 9400 loss 0.0312
+episode: 9500 loss 0.0312
+episode: 9600 loss 0.0323
+episode: 9700 loss 0.0323
+episode: 9800 loss 0.0312
+episode: 9900 loss 0.0323
+episode: 10000 loss 0.0333
+Testing...
+class num: 717
+class num: 717
+seen=0.0016, unseen=0.0000, h=0.0000
+episode: 10100 loss 0.0312
+episode: 10200 loss 0.0333
+episode: 10300 loss 0.0312
+episode: 10400 loss 0.0312
+episode: 10500 loss 0.0323
+episode: 10600 loss 0.0312
+episode: 10700 loss 0.0323
+episode: 10800 loss 0.0312
+episode: 10900 loss 0.0312
+episode: 11000 loss 0.0312
+episode: 11100 loss 0.0323
+episode: 11200 loss 0.0323
+episode: 11300 loss 0.0323
+episode: 11400 loss 0.0312
+episode: 11500 loss 0.0323
+episode: 11600 loss 0.0333
+episode: 11700 loss 0.0312
+episode: 11800 loss 0.0323
+episode: 11900 loss 0.0312
+episode: 12000 loss 0.0312
+Testing...
+class num: 717
+class num: 717
+seen=0.0016, unseen=0.0000, h=0.0000
+episode: 12100 loss 0.0323
+episode: 12200 loss 0.0323
+episode: 12300 loss 0.0323
+episode: 12400 loss 0.0323
+episode: 12500 loss 0.0333
+episode: 12600 loss 0.0323
+episode: 12700 loss 0.0333
+episode: 12800 loss 0.0333
+episode: 12900 loss 0.0323
+episode: 13000 loss 0.0323
+episode: 13100 loss 0.0323
+episode: 13200 loss 0.0333
+episode: 13300 loss 0.0333
+episode: 13400 loss 0.0323
+episode: 13500 loss 0.0312
+episode: 13600 loss 0.0323
+episode: 13700 loss 0.0312
+episode: 13800 loss 0.0323
+episode: 13900 loss 0.0312
+episode: 14000 loss 0.0312
+Testing...
+class num: 717
+class num: 717
+seen=0.0016, unseen=0.0000, h=0.0000
+episode: 14100 loss 0.0323
+episode: 14200 loss 0.0323
+episode: 14300 loss 0.0333
+episode: 14400 loss 0.0312
+episode: 14500 loss 0.0312
+episode: 14600 loss 0.0345
+episode: 14700 loss 0.0333
+episode: 14800 loss 0.0312
+episode: 14900 loss 0.0312
+episode: 15000 loss 0.0333
+episode: 15100 loss 0.0323
+episode: 15200 loss 0.0312
+episode: 15300 loss 0.0312
+episode: 15400 loss 0.0312
+episode: 15500 loss 0.0312
+episode: 15600 loss 0.0333
+episode: 15700 loss 0.0323
+episode: 15800 loss 0.0323
+episode: 15900 loss 0.0312
+episode: 16000 loss 0.0312
+Testing...
+class num: 717
+class num: 717
+seen=0.0016, unseen=0.0000, h=0.0000
+episode: 16100 loss 0.0312
+episode: 16200 loss 0.0323
+episode: 16300 loss 0.0312
+episode: 16400 loss 0.0312
+episode: 16500 loss 0.0323
+episode: 16600 loss 0.0323
+episode: 16700 loss 0.0323
+episode: 16800 loss 0.0312
+episode: 16900 loss 0.0323
+episode: 17000 loss 0.0312
+episode: 17100 loss 0.0312
+episode: 17200 loss 0.0323
+episode: 17300 loss 0.0323
+episode: 17400 loss 0.0323
+episode: 17500 loss 0.0323
+episode: 17600 loss 0.0312
+episode: 17700 loss 0.0312
+episode: 17800 loss 0.0312
+episode: 17900 loss 0.0323
+episode: 18000 loss 0.0312
+Testing...
+class num: 717
+class num: 717
+seen=0.0016, unseen=0.0000, h=0.0000
+episode: 18100 loss 0.0323
+episode: 18200 loss 0.0333
+episode: 18300 loss 0.0312
+episode: 18400 loss 0.0333
+episode: 18500 loss 0.0312
+episode: 18600 loss 0.0312
+episode: 18700 loss 0.0312
+episode: 18800 loss 0.0323
+episode: 18900 loss 0.0312
+episode: 19000 loss 0.0323
+episode: 19100 loss 0.0312
+episode: 19200 loss 0.0312
+episode: 19300 loss 0.0312
+episode: 19400 loss 0.0312
+episode: 19500 loss 0.0323
+episode: 19600 loss 0.0312
+episode: 19700 loss 0.0323
+episode: 19800 loss 0.0333
+episode: 19900 loss 0.0345
+episode: 20000 loss 0.0323
+Testing...
+class num: 717
+class num: 717
+seen=0.0016, unseen=0.0000, h=0.0000
+episode: 20100 loss 0.0312
+episode: 20200 loss 0.0323
+episode: 20300 loss 0.0312
+episode: 20400 loss 0.0323
+episode: 20500 loss 0.0312
+episode: 20600 loss 0.0312
+episode: 20700 loss 0.0312
+episode: 20800 loss 0.0312
+episode: 20900 loss 0.0323
+episode: 21000 loss 0.0312
+episode: 21100 loss 0.0312
+episode: 21200 loss 0.0323
+episode: 21300 loss 0.0323
+episode: 21400 loss 0.0312
+episode: 21500 loss 0.0333
+episode: 21600 loss 0.0323
+episode: 21700 loss 0.0312
+episode: 21800 loss 0.0323
+episode: 21900 loss 0.0323
+episode: 22000 loss 0.0323
+Testing...
+class num: 717
+class num: 717
+seen=0.0016, unseen=0.0000, h=0.0000
+episode: 22100 loss 0.0323
+episode: 22200 loss 0.0312
+episode: 22300 loss 0.0333
+episode: 22400 loss 0.0323
+episode: 22500 loss 0.0333
+episode: 22600 loss 0.0323
+episode: 22700 loss 0.0323
+episode: 22800 loss 0.0323
+episode: 22900 loss 0.0312
+episode: 23000 loss 0.0312
+episode: 23100 loss 0.0312
+episode: 23200 loss 0.0312
+episode: 23300 loss 0.0323
+episode: 23400 loss 0.0333
+episode: 23500 loss 0.0323
+episode: 23600 loss 0.0312
+episode: 23700 loss 0.0312
+episode: 23800 loss 0.0312
+episode: 23900 loss 0.0312
+episode: 24000 loss 0.0323
+Testing...
+class num: 717
+class num: 717
+seen=0.0016, unseen=0.0000, h=0.0000
+episode: 24100 loss 0.0323
+episode: 24200 loss 0.0333
+episode: 24300 loss 0.0345
+episode: 24400 loss 0.0345
+episode: 24500 loss 0.0312
+episode: 24600 loss 0.0312
+episode: 24700 loss 0.0323
+episode: 24800 loss 0.0312
+episode: 24900 loss 0.0323
+episode: 25000 loss 0.0323
+episode: 25100 loss 0.0333
+episode: 25200 loss 0.0323
+episode: 25300 loss 0.0312
+episode: 25400 loss 0.0312
+episode: 25500 loss 0.0323
+episode: 25600 loss 0.0323
+episode: 25700 loss 0.0323
+episode: 25800 loss 0.0333
+episode: 25900 loss 0.0323
+episode: 26000 loss 0.0323
+Testing...
+class num: 717
+class num: 717
+seen=0.0016, unseen=0.0000, h=0.0000
+episode: 26100 loss 0.0323
+episode: 26200 loss 0.0323
+episode: 26300 loss 0.0312
+episode: 26400 loss 0.0312
+episode: 26500 loss 0.0312
+episode: 26600 loss 0.0323
+episode: 26700 loss 0.0323
+episode: 26800 loss 0.0312
+episode: 26900 loss 0.0312
+episode: 27000 loss 0.0312
+episode: 27100 loss 0.0312
+episode: 27200 loss 0.0312
+episode: 27300 loss 0.0323
+episode: 27400 loss 0.0312
+episode: 27500 loss 0.0345
+episode: 27600 loss 0.0312
+episode: 27700 loss 0.0323
+episode: 27800 loss 0.0333
+episode: 27900 loss 0.0312
+episode: 28000 loss 0.0333
+Testing...
+class num: 717
+class num: 717
+seen=0.0016, unseen=0.0000, h=0.0000
+episode: 28100 loss 0.0312
+episode: 28200 loss 0.0323
+episode: 28300 loss 0.0333
+episode: 28400 loss 0.0312
+episode: 28500 loss 0.0323
+episode: 28600 loss 0.0333
+episode: 28700 loss 0.0312
+episode: 28800 loss 0.0333
+episode: 28900 loss 0.0312
+episode: 29000 loss 0.0357
+episode: 29100 loss 0.0312
+episode: 29200 loss 0.0323
+episode: 29300 loss 0.0333
+episode: 29400 loss 0.0323
+episode: 29500 loss 0.0333
+episode: 29600 loss 0.0323
+episode: 29700 loss 0.0312
+episode: 29800 loss 0.0323
+episode: 29900 loss 0.0312
+episode: 30000 loss 0.0323
+Testing...
+class num: 717
+class num: 717
+seen=0.0016, unseen=0.0000, h=0.0000
+episode: 30100 loss 0.0312
+episode: 30200 loss 0.0312
+episode: 30300 loss 0.0323
+episode: 30400 loss 0.0312
+episode: 30500 loss 0.0323
+episode: 30600 loss 0.0312
+episode: 30700 loss 0.0312
+episode: 30800 loss 0.0312
+episode: 30900 loss 0.0312
+episode: 31000 loss 0.0323
+episode: 31100 loss 0.0312
+episode: 31200 loss 0.0333
+episode: 31300 loss 0.0323
+episode: 31400 loss 0.0312
+episode: 31500 loss 0.0323
+episode: 31600 loss 0.0312
+episode: 31700 loss 0.0323
+episode: 31800 loss 0.0323
+episode: 31900 loss 0.0312
+episode: 32000 loss 0.0312
+Testing...
+class num: 717
+class num: 717
+seen=0.0016, unseen=0.0000, h=0.0000
+episode: 32100 loss 0.0312
+episode: 32200 loss 0.0323
+episode: 32300 loss 0.0312
+episode: 32400 loss 0.0312
+episode: 32500 loss 0.0312
+episode: 32600 loss 0.0312
+episode: 32700 loss 0.0312
+episode: 32800 loss 0.0312
+episode: 32900 loss 0.0333
+episode: 33000 loss 0.0323
+episode: 33100 loss 0.0312
+episode: 33200 loss 0.0323
+episode: 33300 loss 0.0312
+episode: 33400 loss 0.0323
+episode: 33500 loss 0.0312
+episode: 33600 loss 0.0312
+episode: 33700 loss 0.0323
+episode: 33800 loss 0.0312
+episode: 33900 loss 0.0312
+episode: 34000 loss 0.0323
+Testing...
+class num: 717
+class num: 717
+seen=0.0016, unseen=0.0000, h=0.0000
+episode: 34100 loss 0.0323
+episode: 34200 loss 0.0312
+episode: 34300 loss 0.0312
+episode: 34400 loss 0.0312
+episode: 34500 loss 0.0323
+episode: 34600 loss 0.0312
+episode: 34700 loss 0.0333
+episode: 34800 loss 0.0333
+episode: 34900 loss 0.0312
+episode: 35000 loss 0.0312
+episode: 35100 loss 0.0333
+episode: 35200 loss 0.0323
+episode: 35300 loss 0.0312
+episode: 35400 loss 0.0323
+episode: 35500 loss 0.0323
+episode: 35600 loss 0.0312
+episode: 35700 loss 0.0323
+episode: 35800 loss 0.0312
+episode: 35900 loss 0.0323
+episode: 36000 loss 0.0312
+Testing...
+class num: 717
+class num: 717
+seen=0.0016, unseen=0.0000, h=0.0000
+episode: 36100 loss 0.0312
+episode: 36200 loss 0.0323
+episode: 36300 loss 0.0323
+episode: 36400 loss 0.0323
+episode: 36500 loss 0.0323
+episode: 36600 loss 0.0312
+episode: 36700 loss 0.0323
+episode: 36800 loss 0.0323
+episode: 36900 loss 0.0312
+episode: 37000 loss 0.0312
+episode: 37100 loss 0.0312
+episode: 37200 loss 0.0333
+episode: 37300 loss 0.0312
+episode: 37400 loss 0.0312
+episode: 37500 loss 0.0333
+episode: 37600 loss 0.0312
+episode: 37700 loss 0.0312
+episode: 37800 loss 0.0312
+episode: 37900 loss 0.0312
+episode: 38000 loss 0.0333
+Testing...
+class num: 717
+class num: 717
+seen=0.0016, unseen=0.0000, h=0.0000
+episode: 38100 loss 0.0323
+episode: 38200 loss 0.0345
+episode: 38300 loss 0.0323
+episode: 38400 loss 0.0323
+episode: 38500 loss 0.0312
+episode: 38600 loss 0.0323
+episode: 38700 loss 0.0333
+episode: 38800 loss 0.0333
+episode: 38900 loss 0.0323
+episode: 39000 loss 0.0323
+episode: 39100 loss 0.0333
+episode: 39200 loss 0.0323
+episode: 39300 loss 0.0323
+episode: 39400 loss 0.0333
+episode: 39500 loss 0.0323
+episode: 39600 loss 0.0323
+episode: 39700 loss 0.0312
+episode: 39800 loss 0.0323
+episode: 39900 loss 0.0345
+episode: 40000 loss 0.0312
+Testing...
+class num: 717
+class num: 717
+seen=0.0016, unseen=0.0000, h=0.0000
+episode: 40100 loss 0.0312
+episode: 40200 loss 0.0333
+episode: 40300 loss 0.0312
+episode: 40400 loss 0.0323
+episode: 40500 loss 0.0323
+episode: 40600 loss 0.0323
+episode: 40700 loss 0.0323
+episode: 40800 loss 0.0312
+episode: 40900 loss 0.0323
+episode: 41000 loss 0.0312
+episode: 41100 loss 0.0312
+episode: 41200 loss 0.0312
+episode: 41300 loss 0.0323
+episode: 41400 loss 0.0323
+episode: 41500 loss 0.0323
+episode: 41600 loss 0.0333
+episode: 41700 loss 0.0312
+episode: 41800 loss 0.0312
+episode: 41900 loss 0.0312
+episode: 42000 loss 0.0312
+Testing...
+class num: 717
+class num: 717
+seen=0.0016, unseen=0.0000, h=0.0000
+episode: 42100 loss 0.0323
+episode: 42200 loss 0.0345
+episode: 42300 loss 0.0312
+episode: 42400 loss 0.0333
+episode: 42500 loss 0.0323
+episode: 42600 loss 0.0312
+episode: 42700 loss 0.0323
+episode: 42800 loss 0.0323
+episode: 42900 loss 0.0323
+episode: 43000 loss 0.0312
+episode: 43100 loss 0.0323
+episode: 43200 loss 0.0323
+episode: 43300 loss 0.0323
+episode: 43400 loss 0.0323
+episode: 43500 loss 0.0323
+episode: 43600 loss 0.0323
+episode: 43700 loss 0.0323
+episode: 43800 loss 0.0333
+episode: 43900 loss 0.0323
+episode: 44000 loss 0.0323
+Testing...
+class num: 717
+class num: 717
+seen=0.0016, unseen=0.0000, h=0.0000
+episode: 44100 loss 0.0323
+episode: 44200 loss 0.0312
+episode: 44300 loss 0.0312
+episode: 44400 loss 0.0312
+episode: 44500 loss 0.0312
+episode: 44600 loss 0.0333
+episode: 44700 loss 0.0333
+episode: 44800 loss 0.0323
+episode: 44900 loss 0.0323
+episode: 45000 loss 0.0333
+episode: 45100 loss 0.0333
+episode: 45200 loss 0.0312
+episode: 45300 loss 0.0312
+episode: 45400 loss 0.0312
+episode: 45500 loss 0.0323
+episode: 45600 loss 0.0323
+episode: 45700 loss 0.0323
+episode: 45800 loss 0.0312
+episode: 45900 loss 0.0333
+episode: 46000 loss 0.0323
+Testing...
+class num: 717
+class num: 717
+seen=0.0016, unseen=0.0000, h=0.0000
+episode: 46100 loss 0.0312
+episode: 46200 loss 0.0323
+episode: 46300 loss 0.0312
+episode: 46400 loss 0.0345
+episode: 46500 loss 0.0323
+episode: 46600 loss 0.0323
+episode: 46700 loss 0.0323
+episode: 46800 loss 0.0323
+episode: 46900 loss 0.0333
+episode: 47000 loss 0.0312
+episode: 47100 loss 0.0312
+episode: 47200 loss 0.0312
+episode: 47300 loss 0.0312
+episode: 47400 loss 0.0333
+episode: 47500 loss 0.0323
+episode: 47600 loss 0.0323
+episode: 47700 loss 0.0323
+episode: 47800 loss 0.0312
+episode: 47900 loss 0.0312
+episode: 48000 loss 0.0312
+Testing...
+class num: 717
+class num: 717
+seen=0.0016, unseen=0.0000, h=0.0000
+episode: 48100 loss 0.0312
+episode: 48200 loss 0.0333
+episode: 48300 loss 0.0323
+episode: 48400 loss 0.0312
+episode: 48500 loss 0.0312
+episode: 48600 loss 0.0312
+episode: 48700 loss 0.0345
+episode: 48800 loss 0.0323
+episode: 48900 loss 0.0312
+episode: 49000 loss 0.0323
+episode: 49100 loss 0.0323
+episode: 49200 loss 0.0312
+episode: 49300 loss 0.0312
+episode: 49400 loss 0.0323
+episode: 49500 loss 0.0312
+episode: 49600 loss 0.0323
+episode: 49700 loss 0.0333
+episode: 49800 loss 0.0333
+episode: 49900 loss 0.0323
+episode: 50000 loss 0.0312
+Testing...
+class num: 717
+class num: 717
+seen=0.0016, unseen=0.0000, h=0.0000
+episode: 50100 loss 0.0333
+episode: 50200 loss 0.0312
+episode: 50300 loss 0.0323
+episode: 50400 loss 0.0323
+episode: 50500 loss 0.0333
+episode: 50600 loss 0.0323
+episode: 50700 loss 0.0323
+episode: 50800 loss 0.0312
+episode: 50900 loss 0.0312
+episode: 51000 loss 0.0312
+episode: 51100 loss 0.0333
+episode: 51200 loss 0.0312
+episode: 51300 loss 0.0312
+episode: 51400 loss 0.0323
+episode: 51500 loss 0.0333
+episode: 51600 loss 0.0312
+episode: 51700 loss 0.0312
+episode: 51800 loss 0.0312
+episode: 51900 loss 0.0323
+episode: 52000 loss 0.0323
+Testing...
+class num: 717
+class num: 717
+seen=0.0016, unseen=0.0000, h=0.0000
+episode: 52100 loss 0.0323
+episode: 52200 loss 0.0312
+episode: 52300 loss 0.0323
+episode: 52400 loss 0.0323
+episode: 52500 loss 0.0333
+episode: 52600 loss 0.0312
+episode: 52700 loss 0.0323
+episode: 52800 loss 0.0312
+episode: 52900 loss 0.0323
+episode: 53000 loss 0.0323
+episode: 53100 loss 0.0312
+episode: 53200 loss 0.0312
+episode: 53300 loss 0.0333
+episode: 53400 loss 0.0323
+episode: 53500 loss 0.0323
+episode: 53600 loss 0.0323
+episode: 53700 loss 0.0323
+episode: 53800 loss 0.0323
+episode: 53900 loss 0.0312
+episode: 54000 loss 0.0312
+Testing...
+class num: 717
+class num: 717
+seen=0.0000, unseen=0.0139, h=0.0000
+episode: 54100 loss 0.0312
+episode: 54200 loss 0.0312
+episode: 54300 loss 0.0312
+episode: 54400 loss 0.0333
+episode: 54500 loss 0.0323
+episode: 54600 loss 0.0345
+episode: 54700 loss 0.0333
+episode: 54800 loss 0.0312
+episode: 54900 loss 0.0333
+episode: 55000 loss 0.0312
+episode: 55100 loss 0.0323
+episode: 55200 loss 0.0312
+episode: 55300 loss 0.0323
+episode: 55400 loss 0.0312
+episode: 55500 loss 0.0312
+episode: 55600 loss 0.0312
+episode: 55700 loss 0.0323
+episode: 55800 loss 0.0312
+episode: 55900 loss 0.0312
+episode: 56000 loss 0.0323
+Testing...
+class num: 717
+class num: 717
+seen=0.0000, unseen=0.0139, h=0.0000
+episode: 56100 loss 0.0323
+episode: 56200 loss 0.0333
+episode: 56300 loss 0.0312
+episode: 56400 loss 0.0323
+episode: 56500 loss 0.0312
+episode: 56600 loss 0.0312
+episode: 56700 loss 0.0312
+episode: 56800 loss 0.0323
+episode: 56900 loss 0.0312
+episode: 57000 loss 0.0312
+episode: 57100 loss 0.0312
+episode: 57200 loss 0.0312
+episode: 57300 loss 0.0323
+episode: 57400 loss 0.0323
+episode: 57500 loss 0.0312
+episode: 57600 loss 0.0323
+episode: 57700 loss 0.0323
+episode: 57800 loss 0.0312
+episode: 57900 loss 0.0312
+episode: 58000 loss 0.0323
+Testing...
+class num: 717
+class num: 717
+seen=0.0016, unseen=0.0000, h=0.0000
+episode: 58100 loss 0.0333
+episode: 58200 loss 0.0312
+episode: 58300 loss 0.0312
+episode: 58400 loss 0.0312
+episode: 58500 loss 0.0312
+episode: 58600 loss 0.0333
+episode: 58700 loss 0.0323
+episode: 58800 loss 0.0312
+episode: 58900 loss 0.0307
+episode: 59000 loss 0.0277
+episode: 59100 loss 0.0263
+episode: 59200 loss 0.0243
+episode: 59300 loss 0.0229
+episode: 59400 loss 0.0193
+episode: 59500 loss 0.0202
+episode: 59600 loss 0.0170
+episode: 59700 loss 0.0184
+episode: 59800 loss 0.0172
+episode: 59900 loss 0.0181
+episode: 60000 loss 0.0175
+Testing...
+class num: 717
+class num: 717
+seen=0.2368, unseen=0.1688, h=0.1971
+save networks for episode: 59999
+episode: 60100 loss 0.0153
+episode: 60200 loss 0.0162
+episode: 60300 loss 0.0175
+episode: 60400 loss 0.0151
+episode: 60500 loss 0.0154
+episode: 60600 loss 0.0138
+episode: 60700 loss 0.0124
+episode: 60800 loss 0.0152
+episode: 60900 loss 0.0149
+episode: 61000 loss 0.0131
+episode: 61100 loss 0.0156
+episode: 61200 loss 0.0177
+episode: 61300 loss 0.0146
+episode: 61400 loss 0.0150
+episode: 61500 loss 0.0108
+episode: 61600 loss 0.0140
+episode: 61700 loss 0.0125
+episode: 61800 loss 0.0105
+episode: 61900 loss 0.0131
+episode: 62000 loss 0.0118
+Testing...
+class num: 717
+class num: 717
+seen=0.2899, unseen=0.1937, h=0.2323
+save networks for episode: 61999
+episode: 62100 loss 0.0097
+episode: 62200 loss 0.0113
+episode: 62300 loss 0.0105
+episode: 62400 loss 0.0119
+episode: 62500 loss 0.0124
+episode: 62600 loss 0.0112
+episode: 62700 loss 0.0116
+episode: 62800 loss 0.0119
+episode: 62900 loss 0.0079
+episode: 63000 loss 0.0095
+episode: 63100 loss 0.0098
+episode: 63200 loss 0.0097
+episode: 63300 loss 0.0136
+episode: 63400 loss 0.0090
+episode: 63500 loss 0.0121
+episode: 63600 loss 0.0085
+episode: 63700 loss 0.0124
+episode: 63800 loss 0.0089
+episode: 63900 loss 0.0115
+episode: 64000 loss 0.0096
+Testing...
+class num: 717
+class num: 717
+seen=0.3182, unseen=0.2069, h=0.2508
+save networks for episode: 63999
+episode: 64100 loss 0.0113
+episode: 64200 loss 0.0124
+episode: 64300 loss 0.0121
+episode: 64400 loss 0.0092
+episode: 64500 loss 0.0123
+episode: 64600 loss 0.0082
+episode: 64700 loss 0.0122
+episode: 64800 loss 0.0089
+episode: 64900 loss 0.0110
+episode: 65000 loss 0.0111
+episode: 65100 loss 0.0115
+episode: 65200 loss 0.0137
+episode: 65300 loss 0.0103
+episode: 65400 loss 0.0125
+episode: 65500 loss 0.0092
+episode: 65600 loss 0.0109
+episode: 65700 loss 0.0085
+episode: 65800 loss 0.0091
+episode: 65900 loss 0.0093
+episode: 66000 loss 0.0086
+Testing...
+class num: 717
+class num: 717
+seen=0.3256, unseen=0.2285, h=0.2685
+save networks for episode: 65999
+episode: 66100 loss 0.0081
+episode: 66200 loss 0.0115
+episode: 66300 loss 0.0081
+episode: 66400 loss 0.0103
+episode: 66500 loss 0.0094
+episode: 66600 loss 0.0094
+episode: 66700 loss 0.0100
+episode: 66800 loss 0.0069
+episode: 66900 loss 0.0063
+episode: 67000 loss 0.0107
+episode: 67100 loss 0.0125
+episode: 67200 loss 0.0071
+episode: 67300 loss 0.0102
+episode: 67400 loss 0.0060
+episode: 67500 loss 0.0106
+episode: 67600 loss 0.0086
+episode: 67700 loss 0.0095
+episode: 67800 loss 0.0103
+episode: 67900 loss 0.0078
+episode: 68000 loss 0.0075
+Testing...
+class num: 717
+class num: 717
+seen=0.3496, unseen=0.2299, h=0.2774
+save networks for episode: 67999
+episode: 68100 loss 0.0065
+episode: 68200 loss 0.0080
+episode: 68300 loss 0.0074
+episode: 68400 loss 0.0087
+episode: 68500 loss 0.0074
+episode: 68600 loss 0.0063
+episode: 68700 loss 0.0100
+episode: 68800 loss 0.0071
+episode: 68900 loss 0.0063
+episode: 69000 loss 0.0085
+episode: 69100 loss 0.0108
+episode: 69200 loss 0.0065
+episode: 69300 loss 0.0063
+episode: 69400 loss 0.0060
+episode: 69500 loss 0.0116
+episode: 69600 loss 0.0092
+episode: 69700 loss 0.0095
+episode: 69800 loss 0.0059
+episode: 69900 loss 0.0036
+episode: 70000 loss 0.0066
+Testing...
+class num: 717
+class num: 717
+seen=0.3554, unseen=0.2493, h=0.2931
+save networks for episode: 69999
+episode: 70100 loss 0.0043
+episode: 70200 loss 0.0102
+episode: 70300 loss 0.0070
+episode: 70400 loss 0.0072
+episode: 70500 loss 0.0064
+episode: 70600 loss 0.0088
+episode: 70700 loss 0.0049
+episode: 70800 loss 0.0083
+episode: 70900 loss 0.0053
+episode: 71000 loss 0.0080
+episode: 71100 loss 0.0079
+episode: 71200 loss 0.0071
+episode: 71300 loss 0.0067
+episode: 71400 loss 0.0061
+episode: 71500 loss 0.0063
+episode: 71600 loss 0.0070
+episode: 71700 loss 0.0090
+episode: 71800 loss 0.0085
+episode: 71900 loss 0.0066
+episode: 72000 loss 0.0063
+Testing...
+class num: 717
+class num: 717
+seen=0.3589, unseen=0.2403, h=0.2879
+episode: 72100 loss 0.0056
+episode: 72200 loss 0.0083
+episode: 72300 loss 0.0070
+episode: 72400 loss 0.0075
+episode: 72500 loss 0.0056
+episode: 72600 loss 0.0036
+episode: 72700 loss 0.0052
+episode: 72800 loss 0.0087
+episode: 72900 loss 0.0055
+episode: 73000 loss 0.0067
+episode: 73100 loss 0.0081
+episode: 73200 loss 0.0064
+episode: 73300 loss 0.0049
+episode: 73400 loss 0.0070
+episode: 73500 loss 0.0045
+episode: 73600 loss 0.0062
+episode: 73700 loss 0.0049
+episode: 73800 loss 0.0050
+episode: 73900 loss 0.0063
+episode: 74000 loss 0.0089
+Testing...
+class num: 717
+class num: 717
+seen=0.3671, unseen=0.2583, h=0.3032
+save networks for episode: 73999
+episode: 74100 loss 0.0032
+episode: 74200 loss 0.0058
+episode: 74300 loss 0.0050
+episode: 74400 loss 0.0050
+episode: 74500 loss 0.0046
+episode: 74600 loss 0.0070
+episode: 74700 loss 0.0081
+episode: 74800 loss 0.0073
+episode: 74900 loss 0.0051
+episode: 75000 loss 0.0077
+episode: 75100 loss 0.0039
+episode: 75200 loss 0.0057
+episode: 75300 loss 0.0061
+episode: 75400 loss 0.0073
+episode: 75500 loss 0.0060
+episode: 75600 loss 0.0064
+episode: 75700 loss 0.0059
+episode: 75800 loss 0.0044
+episode: 75900 loss 0.0058
+episode: 76000 loss 0.0066
+Testing...
+class num: 717
+class num: 717
+seen=0.3733, unseen=0.2604, h=0.3068
+save networks for episode: 75999
+episode: 76100 loss 0.0065
+episode: 76200 loss 0.0044
+episode: 76300 loss 0.0048
+episode: 76400 loss 0.0052
+episode: 76500 loss 0.0052
+episode: 76600 loss 0.0061
+episode: 76700 loss 0.0055
+episode: 76800 loss 0.0086
+episode: 76900 loss 0.0045
+episode: 77000 loss 0.0040
+episode: 77100 loss 0.0073
+episode: 77200 loss 0.0050
+episode: 77300 loss 0.0065
+episode: 77400 loss 0.0048
+episode: 77500 loss 0.0047
+episode: 77600 loss 0.0042
+episode: 77700 loss 0.0058
+episode: 77800 loss 0.0074
+episode: 77900 loss 0.0054
+episode: 78000 loss 0.0053
+Testing...
+class num: 717
+class num: 717
+seen=0.3802, unseen=0.2750, h=0.3192
+save networks for episode: 77999
+episode: 78100 loss 0.0057
+episode: 78200 loss 0.0025
+episode: 78300 loss 0.0048
+episode: 78400 loss 0.0052
+episode: 78500 loss 0.0067
+episode: 78600 loss 0.0036
+episode: 78700 loss 0.0053
+episode: 78800 loss 0.0091
+episode: 78900 loss 0.0045
+episode: 79000 loss 0.0068
+episode: 79100 loss 0.0034
+episode: 79200 loss 0.0058
+episode: 79300 loss 0.0042
+episode: 79400 loss 0.0062
+episode: 79500 loss 0.0027
+episode: 79600 loss 0.0052
+episode: 79700 loss 0.0039
+episode: 79800 loss 0.0048
+episode: 79900 loss 0.0041
+episode: 80000 loss 0.0047
+Testing...
+class num: 717
+class num: 717
+seen=0.3767, unseen=0.2840, h=0.3239
+save networks for episode: 79999
+episode: 80100 loss 0.0047
+episode: 80200 loss 0.0038
+episode: 80300 loss 0.0053
+episode: 80400 loss 0.0043
+episode: 80500 loss 0.0022
+episode: 80600 loss 0.0077
+episode: 80700 loss 0.0050
+episode: 80800 loss 0.0028
+episode: 80900 loss 0.0026
+episode: 81000 loss 0.0030
+episode: 81100 loss 0.0056
+episode: 81200 loss 0.0055
+episode: 81300 loss 0.0054
+episode: 81400 loss 0.0033
+episode: 81500 loss 0.0031
+episode: 81600 loss 0.0067
+episode: 81700 loss 0.0030
+episode: 81800 loss 0.0060
+episode: 81900 loss 0.0029
+episode: 82000 loss 0.0026
+Testing...
+class num: 717
+class num: 717
+seen=0.3841, unseen=0.2813, h=0.3247
+save networks for episode: 81999
+episode: 82100 loss 0.0042
+episode: 82200 loss 0.0043
+episode: 82300 loss 0.0056
+episode: 82400 loss 0.0024
+episode: 82500 loss 0.0025
+episode: 82600 loss 0.0026
+episode: 82700 loss 0.0030
+episode: 82800 loss 0.0038
+episode: 82900 loss 0.0041
+episode: 83000 loss 0.0056
+episode: 83100 loss 0.0051
+episode: 83200 loss 0.0046
+episode: 83300 loss 0.0031
+episode: 83400 loss 0.0037
+episode: 83500 loss 0.0048
+episode: 83600 loss 0.0048
+episode: 83700 loss 0.0052
+episode: 83800 loss 0.0033
+episode: 83900 loss 0.0048
+episode: 84000 loss 0.0029
+Testing...
+class num: 717
+class num: 717
+seen=0.3864, unseen=0.2868, h=0.3292
+save networks for episode: 83999
+episode: 84100 loss 0.0050
+episode: 84200 loss 0.0025
+episode: 84300 loss 0.0026
+episode: 84400 loss 0.0031
+episode: 84500 loss 0.0050
+episode: 84600 loss 0.0035
+episode: 84700 loss 0.0045
+episode: 84800 loss 0.0021
+episode: 84900 loss 0.0015
+episode: 85000 loss 0.0049
+episode: 85100 loss 0.0042
+episode: 85200 loss 0.0039
+episode: 85300 loss 0.0029
+episode: 85400 loss 0.0031
+episode: 85500 loss 0.0074
+episode: 85600 loss 0.0040
+episode: 85700 loss 0.0041
+episode: 85800 loss 0.0029
+episode: 85900 loss 0.0030
+episode: 86000 loss 0.0079
+Testing...
+class num: 717
+class num: 717
+seen=0.3841, unseen=0.2861, h=0.3279
+episode: 86100 loss 0.0059
+episode: 86200 loss 0.0032
+episode: 86300 loss 0.0047
+episode: 86400 loss 0.0052
+episode: 86500 loss 0.0031
+episode: 86600 loss 0.0054
+episode: 86700 loss 0.0041
+episode: 86800 loss 0.0026
+episode: 86900 loss 0.0047
+episode: 87000 loss 0.0052
+episode: 87100 loss 0.0034
+episode: 87200 loss 0.0036
+episode: 87300 loss 0.0047
+episode: 87400 loss 0.0032
+episode: 87500 loss 0.0036
+episode: 87600 loss 0.0066
+episode: 87700 loss 0.0038
+episode: 87800 loss 0.0047
+episode: 87900 loss 0.0031
+episode: 88000 loss 0.0038
+Testing...
+class num: 717
+class num: 717
+seen=0.3942, unseen=0.2944, h=0.3371
+save networks for episode: 87999
+episode: 88100 loss 0.0032
+episode: 88200 loss 0.0032
+episode: 88300 loss 0.0049
+episode: 88400 loss 0.0017
+episode: 88500 loss 0.0024
+episode: 88600 loss 0.0033
+episode: 88700 loss 0.0021
+episode: 88800 loss 0.0018
+episode: 88900 loss 0.0054
+episode: 89000 loss 0.0050
+episode: 89100 loss 0.0032
+episode: 89200 loss 0.0017
+episode: 89300 loss 0.0048
+episode: 89400 loss 0.0050
+episode: 89500 loss 0.0047
+episode: 89600 loss 0.0030
+episode: 89700 loss 0.0016
+episode: 89800 loss 0.0043
+episode: 89900 loss 0.0031
+episode: 90000 loss 0.0042
+Testing...
+class num: 717
+class num: 717
+seen=0.3899, unseen=0.2993, h=0.3387
+save networks for episode: 89999
+episode: 90100 loss 0.0018
+episode: 90200 loss 0.0031
+episode: 90300 loss 0.0026
+episode: 90400 loss 0.0036
+episode: 90500 loss 0.0063
+episode: 90600 loss 0.0033
+episode: 90700 loss 0.0037
+episode: 90800 loss 0.0028
+episode: 90900 loss 0.0034
+episode: 91000 loss 0.0065
+episode: 91100 loss 0.0032
+episode: 91200 loss 0.0029
+episode: 91300 loss 0.0044
+episode: 91400 loss 0.0017
+episode: 91500 loss 0.0018
+episode: 91600 loss 0.0027
+episode: 91700 loss 0.0052
+episode: 91800 loss 0.0038
+episode: 91900 loss 0.0054
+episode: 92000 loss 0.0053
+Testing...
+class num: 717
+class num: 717
+seen=0.3899, unseen=0.3035, h=0.3413
+save networks for episode: 91999
+episode: 92100 loss 0.0036
+episode: 92200 loss 0.0020
+episode: 92300 loss 0.0009
+episode: 92400 loss 0.0048
+episode: 92500 loss 0.0043
+episode: 92600 loss 0.0027
+episode: 92700 loss 0.0018
+episode: 92800 loss 0.0024
+episode: 92900 loss 0.0022
+episode: 93000 loss 0.0044
+episode: 93100 loss 0.0038
+episode: 93200 loss 0.0029
+episode: 93300 loss 0.0030
+episode: 93400 loss 0.0032
+episode: 93500 loss 0.0024
+episode: 93600 loss 0.0021
+episode: 93700 loss 0.0035
+episode: 93800 loss 0.0027
+episode: 93900 loss 0.0027
+episode: 94000 loss 0.0030
+Testing...
+class num: 717
+class num: 717
+seen=0.3888, unseen=0.2965, h=0.3364
+episode: 94100 loss 0.0034
+episode: 94200 loss 0.0015
+episode: 94300 loss 0.0037
+episode: 94400 loss 0.0029
+episode: 94500 loss 0.0014
+episode: 94600 loss 0.0020
+episode: 94700 loss 0.0028
+episode: 94800 loss 0.0033
+episode: 94900 loss 0.0040
+episode: 95000 loss 0.0030
+episode: 95100 loss 0.0012
+episode: 95200 loss 0.0040
+episode: 95300 loss 0.0035
+episode: 95400 loss 0.0024
+episode: 95500 loss 0.0013
+episode: 95600 loss 0.0018
+episode: 95700 loss 0.0027
+episode: 95800 loss 0.0008
+episode: 95900 loss 0.0013
+episode: 96000 loss 0.0033
+Testing...
+class num: 717
+class num: 717
+seen=0.3922, unseen=0.2819, h=0.3281
+episode: 96100 loss 0.0027
+episode: 96200 loss 0.0021
+episode: 96300 loss 0.0020
+episode: 96400 loss 0.0020
+episode: 96500 loss 0.0028
+episode: 96600 loss 0.0037
+episode: 96700 loss 0.0019
+episode: 96800 loss 0.0024
+episode: 96900 loss 0.0044
+episode: 97000 loss 0.0025
+episode: 97100 loss 0.0030
+episode: 97200 loss 0.0013
+episode: 97300 loss 0.0020
+episode: 97400 loss 0.0013
+episode: 97500 loss 0.0021
+episode: 97600 loss 0.0040
+episode: 97700 loss 0.0035
+episode: 97800 loss 0.0014
+episode: 97900 loss 0.0013
+episode: 98000 loss 0.0034
+Testing...
+class num: 717
+class num: 717
+seen=0.3961, unseen=0.2958, h=0.3387
+episode: 98100 loss 0.0019
+episode: 98200 loss 0.0045
+episode: 98300 loss 0.0038
+episode: 98400 loss 0.0026
+episode: 98500 loss 0.0029
+episode: 98600 loss 0.0025
+episode: 98700 loss 0.0012
+episode: 98800 loss 0.0020
+episode: 98900 loss 0.0037
+episode: 99000 loss 0.0010
+episode: 99100 loss 0.0035
+episode: 99200 loss 0.0029
+episode: 99300 loss 0.0031
+episode: 99400 loss 0.0040
+episode: 99500 loss 0.0019
+episode: 99600 loss 0.0024
+episode: 99700 loss 0.0058
+episode: 99800 loss 0.0074
+episode: 99900 loss 0.0018
+episode: 100000 loss 0.0019
+Testing...
+class num: 717
+class num: 717
+seen=0.3961, unseen=0.3097, h=0.3476
+save networks for episode: 99999
+episode: 100100 loss 0.0026
+episode: 100200 loss 0.0033
+episode: 100300 loss 0.0031
+episode: 100400 loss 0.0008
+episode: 100500 loss 0.0029
+episode: 100600 loss 0.0053
+episode: 100700 loss 0.0027
+episode: 100800 loss 0.0053
+episode: 100900 loss 0.0022
+episode: 101000 loss 0.0044
+episode: 101100 loss 0.0009
+episode: 101200 loss 0.0031
+episode: 101300 loss 0.0028
+episode: 101400 loss 0.0037
+episode: 101500 loss 0.0015
+episode: 101600 loss 0.0080
+episode: 101700 loss 0.0023
+episode: 101800 loss 0.0036
+episode: 101900 loss 0.0031
+episode: 102000 loss 0.0027
+Testing...
+class num: 717
+class num: 717
+seen=0.3926, unseen=0.3181, h=0.3514
+save networks for episode: 101999
+episode: 102100 loss 0.0044
+episode: 102200 loss 0.0027
+episode: 102300 loss 0.0021
+episode: 102400 loss 0.0004
+episode: 102500 loss 0.0033
+episode: 102600 loss 0.0018
+episode: 102700 loss 0.0021
+episode: 102800 loss 0.0031
+episode: 102900 loss 0.0030
+episode: 103000 loss 0.0007
+episode: 103100 loss 0.0019
+episode: 103200 loss 0.0022
+episode: 103300 loss 0.0007
+episode: 103400 loss 0.0024
+episode: 103500 loss 0.0042
+episode: 103600 loss 0.0009
+episode: 103700 loss 0.0011
+episode: 103800 loss 0.0015
+episode: 103900 loss 0.0034
+episode: 104000 loss 0.0019
+Testing...
+class num: 717
+class num: 717
+seen=0.3926, unseen=0.3021, h=0.3415
+episode: 104100 loss 0.0020
+episode: 104200 loss 0.0028
+episode: 104300 loss 0.0034
+episode: 104400 loss 0.0010
+episode: 104500 loss 0.0015
+episode: 104600 loss 0.0022
+episode: 104700 loss 0.0027
+episode: 104800 loss 0.0011
+episode: 104900 loss 0.0014
+episode: 105000 loss 0.0035
+episode: 105100 loss 0.0035
+episode: 105200 loss 0.0026
+episode: 105300 loss 0.0032
+episode: 105400 loss 0.0015
+episode: 105500 loss 0.0022
+episode: 105600 loss 0.0036
+episode: 105700 loss 0.0007
+episode: 105800 loss 0.0020
+episode: 105900 loss 0.0009
+episode: 106000 loss 0.0020
+Testing...
+class num: 717
+class num: 717
+seen=0.3938, unseen=0.3181, h=0.3519
+save networks for episode: 105999
+episode: 106100 loss 0.0029
+episode: 106200 loss 0.0021
+episode: 106300 loss 0.0040
+episode: 106400 loss 0.0012
+episode: 106500 loss 0.0016
+episode: 106600 loss 0.0052
+episode: 106700 loss 0.0031
+episode: 106800 loss 0.0055
+episode: 106900 loss 0.0014
+episode: 107000 loss 0.0022
+episode: 107100 loss 0.0008
+episode: 107200 loss 0.0074
+episode: 107300 loss 0.0018
+episode: 107400 loss 0.0029
+episode: 107500 loss 0.0022
+episode: 107600 loss 0.0010
+episode: 107700 loss 0.0006
+episode: 107800 loss 0.0023
+episode: 107900 loss 0.0013
+episode: 108000 loss 0.0015
+Testing...
+class num: 717
+class num: 717
+seen=0.3965, unseen=0.2986, h=0.3407
+episode: 108100 loss 0.0024
+episode: 108200 loss 0.0020
+episode: 108300 loss 0.0009
+episode: 108400 loss 0.0009
+episode: 108500 loss 0.0013
+episode: 108600 loss 0.0019
+episode: 108700 loss 0.0010
+episode: 108800 loss 0.0023
+episode: 108900 loss 0.0021
+episode: 109000 loss 0.0013
+episode: 109100 loss 0.0007
+episode: 109200 loss 0.0019
+episode: 109300 loss 0.0025
+episode: 109400 loss 0.0029
+episode: 109500 loss 0.0019
+episode: 109600 loss 0.0034
+episode: 109700 loss 0.0035
+episode: 109800 loss 0.0021
+episode: 109900 loss 0.0013
+episode: 110000 loss 0.0007
+Testing...
+class num: 717
+class num: 717
+seen=0.4019, unseen=0.3167, h=0.3542
+save networks for episode: 109999
+episode: 110100 loss 0.0022
+episode: 110200 loss 0.0009
+episode: 110300 loss 0.0015
+episode: 110400 loss 0.0025
+episode: 110500 loss 0.0018
+episode: 110600 loss 0.0008
+episode: 110700 loss 0.0047
+episode: 110800 loss 0.0026
+episode: 110900 loss 0.0033
+episode: 111000 loss 0.0008
+episode: 111100 loss 0.0009
+episode: 111200 loss 0.0012
+episode: 111300 loss 0.0013
+episode: 111400 loss 0.0006
+episode: 111500 loss 0.0005
+episode: 111600 loss 0.0011
+episode: 111700 loss 0.0039
+episode: 111800 loss 0.0032
+episode: 111900 loss 0.0015
+episode: 112000 loss 0.0016
+Testing...
+class num: 717
+class num: 717
+seen=0.4016, unseen=0.3215, h=0.3571
+save networks for episode: 111999
+episode: 112100 loss 0.0007
+episode: 112200 loss 0.0017
+episode: 112300 loss 0.0010
+episode: 112400 loss 0.0012
+episode: 112500 loss 0.0020
+episode: 112600 loss 0.0017
+episode: 112700 loss 0.0038
+episode: 112800 loss 0.0007
+episode: 112900 loss 0.0023
+episode: 113000 loss 0.0019
+episode: 113100 loss 0.0017
+episode: 113200 loss 0.0019
+episode: 113300 loss 0.0018
+episode: 113400 loss 0.0016
+episode: 113500 loss 0.0023
+episode: 113600 loss 0.0019
+episode: 113700 loss 0.0045
+episode: 113800 loss 0.0022
+episode: 113900 loss 0.0025
+episode: 114000 loss 0.0034
+Testing...
+class num: 717
+class num: 717
+seen=0.3988, unseen=0.3125, h=0.3504
+episode: 114100 loss 0.0018
+episode: 114200 loss 0.0005
+episode: 114300 loss 0.0017
+episode: 114400 loss 0.0010
+episode: 114500 loss 0.0013
+episode: 114600 loss 0.0005
+episode: 114700 loss 0.0016
+episode: 114800 loss 0.0034
+episode: 114900 loss 0.0025
+episode: 115000 loss 0.0007
+episode: 115100 loss 0.0020
+episode: 115200 loss 0.0007
+episode: 115300 loss 0.0024
+episode: 115400 loss 0.0016
+episode: 115500 loss 0.0013
+episode: 115600 loss 0.0017
+episode: 115700 loss 0.0014
+episode: 115800 loss 0.0012
+episode: 115900 loss 0.0019
+episode: 116000 loss 0.0019
+Testing...
+class num: 717
+class num: 717
+seen=0.4023, unseen=0.3264, h=0.3604
+save networks for episode: 115999
+episode: 116100 loss 0.0018
+episode: 116200 loss 0.0017
+episode: 116300 loss 0.0028
+episode: 116400 loss 0.0020
+episode: 116500 loss 0.0027
+episode: 116600 loss 0.0002
+episode: 116700 loss 0.0016
+episode: 116800 loss 0.0018
+episode: 116900 loss 0.0008
+episode: 117000 loss 0.0028
+episode: 117100 loss 0.0020
+episode: 117200 loss 0.0010
+episode: 117300 loss 0.0031
+episode: 117400 loss 0.0026
+episode: 117500 loss 0.0017
+episode: 117600 loss 0.0011
+episode: 117700 loss 0.0031
+episode: 117800 loss 0.0018
+episode: 117900 loss 0.0010
+episode: 118000 loss 0.0018
+Testing...
+class num: 717
+class num: 717
+seen=0.4039, unseen=0.3056, h=0.3479
+episode: 118100 loss 0.0039
+episode: 118200 loss 0.0015
+episode: 118300 loss 0.0011
+episode: 118400 loss 0.0041
+episode: 118500 loss 0.0025
+episode: 118600 loss 0.0013
+episode: 118700 loss 0.0025
+episode: 118800 loss 0.0018
+episode: 118900 loss 0.0014
+episode: 119000 loss 0.0012
+episode: 119100 loss 0.0044
+episode: 119200 loss 0.0016
+episode: 119300 loss 0.0017
+episode: 119400 loss 0.0015
+episode: 119500 loss 0.0018
+episode: 119600 loss 0.0023
+episode: 119700 loss 0.0020
+episode: 119800 loss 0.0006
+episode: 119900 loss 0.0010
+episode: 120000 loss 0.0025
+Testing...
+class num: 717
+class num: 717
+seen=0.4027, unseen=0.3014, h=0.3448
+episode: 120100 loss 0.0024
+episode: 120200 loss 0.0017
+episode: 120300 loss 0.0005
+episode: 120400 loss 0.0017
+episode: 120500 loss 0.0033
+episode: 120600 loss 0.0012
+episode: 120700 loss 0.0008
+episode: 120800 loss 0.0015
+episode: 120900 loss 0.0016
+episode: 121000 loss 0.0014
+episode: 121100 loss 0.0024
+episode: 121200 loss 0.0009
+episode: 121300 loss 0.0002
+episode: 121400 loss 0.0009
+episode: 121500 loss 0.0003
+episode: 121600 loss 0.0033
+episode: 121700 loss 0.0024
+episode: 121800 loss 0.0007
+episode: 121900 loss 0.0012
+episode: 122000 loss 0.0026
+Testing...
+class num: 717
+class num: 717
+seen=0.4039, unseen=0.3028, h=0.3461
+episode: 122100 loss 0.0020
+episode: 122200 loss 0.0005
+episode: 122300 loss 0.0024
+episode: 122400 loss 0.0017
+episode: 122500 loss 0.0006
+episode: 122600 loss 0.0005
+episode: 122700 loss 0.0006
+episode: 122800 loss 0.0026
+episode: 122900 loss 0.0012
+episode: 123000 loss 0.0019
+episode: 123100 loss 0.0004
+episode: 123200 loss 0.0017
+episode: 123300 loss 0.0016
+episode: 123400 loss 0.0008
+episode: 123500 loss 0.0031
+episode: 123600 loss 0.0010
+episode: 123700 loss 0.0010
+episode: 123800 loss 0.0033
+episode: 123900 loss 0.0006
+episode: 124000 loss 0.0003
+Testing...
+class num: 717
+class num: 717
+seen=0.4039, unseen=0.3160, h=0.3546
+episode: 124100 loss 0.0028
+episode: 124200 loss 0.0004
+episode: 124300 loss 0.0009
+episode: 124400 loss 0.0013
+episode: 124500 loss 0.0007
+episode: 124600 loss 0.0021
+episode: 124700 loss 0.0006
+episode: 124800 loss 0.0007
+episode: 124900 loss 0.0030
+episode: 125000 loss 0.0017
+episode: 125100 loss 0.0006
+episode: 125200 loss 0.0017
+episode: 125300 loss 0.0019
+episode: 125400 loss 0.0005
+episode: 125500 loss 0.0022
+episode: 125600 loss 0.0018
+episode: 125700 loss 0.0017
+episode: 125800 loss 0.0019
+episode: 125900 loss 0.0012
+episode: 126000 loss 0.0016
+Testing...
+class num: 717
+class num: 717
+seen=0.4043, unseen=0.3118, h=0.3521
+episode: 126100 loss 0.0012
+episode: 126200 loss 0.0023
+episode: 126300 loss 0.0012
+episode: 126400 loss 0.0014
+episode: 126500 loss 0.0014
+episode: 126600 loss 0.0023
+episode: 126700 loss 0.0001
+episode: 126800 loss 0.0017
+episode: 126900 loss 0.0016
+episode: 127000 loss 0.0022
+episode: 127100 loss 0.0019
+episode: 127200 loss 0.0031
+episode: 127300 loss 0.0016
+episode: 127400 loss 0.0016
+episode: 127500 loss 0.0014
+episode: 127600 loss 0.0006
+episode: 127700 loss 0.0044
+episode: 127800 loss 0.0029
+episode: 127900 loss 0.0014
+episode: 128000 loss 0.0011
+Testing...
+class num: 717
+class num: 717
+seen=0.4070, unseen=0.2938, h=0.3412
+episode: 128100 loss 0.0023
+episode: 128200 loss 0.0003
+episode: 128300 loss 0.0019
+episode: 128400 loss 0.0020
+episode: 128500 loss 0.0006
+episode: 128600 loss 0.0019
+episode: 128700 loss 0.0003
+episode: 128800 loss 0.0018
+episode: 128900 loss 0.0022
+episode: 129000 loss 0.0022
+episode: 129100 loss 0.0042
+episode: 129200 loss 0.0008
+episode: 129300 loss 0.0007
+episode: 129400 loss 0.0021
+episode: 129500 loss 0.0020
+episode: 129600 loss 0.0013
+episode: 129700 loss 0.0010
+episode: 129800 loss 0.0016
+episode: 129900 loss 0.0014
+episode: 130000 loss 0.0010
+Testing...
+class num: 717
+class num: 717
+seen=0.4008, unseen=0.2993, h=0.3427
